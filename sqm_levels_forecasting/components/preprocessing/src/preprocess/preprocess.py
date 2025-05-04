@@ -3,18 +3,29 @@ import yaml
 import utm
 import pandas as pd
 import numpy as np
+from google.cloud import storage
 from geopy.distance import geodesic
 from datetime import date, timedelta
 from statsmodels.tsa.seasonal import STL
 import matplotlib.pyplot as plt
 from typing import List, Tuple
 from sklearn.preprocessing import StandardScaler
+from pyproj import Proj, Transformer
+import itertools
 from sklearn.metrics import silhouette_score
 from tqdm import tqdm
 from tslearn.clustering import TimeSeriesKMeans
 from prophet import Prophet
 from sklearn.metrics import mean_absolute_error, mean_absolute_error, mean_squared_error
 import warnings
+import logging
+
+logger = logging.getLogger('cmdstanpy')
+logger.addHandler(logging.NullHandler())
+logger.propagate = False
+logger.setLevel(logging.CRITICAL)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(module)s - %(message)s')
 
 # Filter the specific FutureWarning about force_all_finite
 warnings.filterwarnings(
@@ -26,21 +37,28 @@ warnings.filterwarnings(
 
 class Preprocess:
 
-    def __init__(self, path: str='data/', context: str='local', max_days: int=25, len_history: int=1826):
-
+    def __init__(self, train_end: date, h: int=60, len_train: int=730, max_days: int=25, len_history: int=1826, path: str='data/', bucket_name: str='sqm-data-bucket', context: str='local'):
+        
+        self.train_end = train_end
+        self.h = h
+        self.len_train = len_train
         self.max_days = max_days
         self.len_history = len_history
         self.path = path
+        self.bucket_name = bucket_name
         self.context = context
+        logging.info(f"Initializing Preprocess in {context} context")
 
         if self.context == 'google_drive':
             from google.colab import drive
             drive.mount('/content/drive')
 
-        self.data_wells = self.read_parquet('wells_data')
-        self.data_meteo = self.read_parquet('meteo_data')
         self.wells_info = self.read_info_yaml('wells')
         self.meteo_info = self.read_info_yaml('meteo')
+        self.data_wells_raw = self.read_parquet('wells_data')
+        self.data_meteo_raw = self.read_parquet('meteo_data')
+        self.data_wells = self.data_wells_raw.copy()
+        self.data_meteo = self.data_meteo_raw.copy()
         self.meteo_well_comb = None
         self.data = None
         self.data_train = None
@@ -69,23 +87,23 @@ class Preprocess:
             elif self.context == 'vertex':
                 blob_name = f'config-data/{station_type}.yaml'
                 client = storage.Client()
-                bucket = client.bucket(self.bucket)
+                bucket = client.bucket(self.bucket_name)
                 blob = bucket.blob(blob_name)
                 contenido_yaml = blob.download_as_text()
                 data = yaml.safe_load(contenido_yaml)
                 return data
             else:
-                logging.error(f"Unknown context: {self.context}. Cannot read info YAML.")
+                logging.error(f"Unknown context: {self.context}. Cannot read info YAML for {station_type}.")
                 return None
 
         except FileNotFoundError:
-            logging.error(f"YAML file not found: {yaml_path}")
+            logging.error(f"YAML file for {station_type} not found: {yaml_path}")
             return None
         except yaml.YAMLError as e:
-            logging.error(f"Error parsing YAML file {yaml_path}: {e}")
+            logging.error(f"Error parsing YAML file for {station_type} {yaml_path}: {e}")
             return None
         except Exception as e:
-            logging.error(f"An unexpected error occurred while reading YAML from GCS: {e}")
+            logging.error(f"An unexpected error occurred while reading YAML from GCS for {station_type}: {e}")
             return None
 
 
@@ -97,8 +115,15 @@ class Preprocess:
         Returns:
             pd.DataFrame: A DataFrame containing the data loaded.
         """
-        path = f"{self.path}{file_path}.parquet"
+        if self.context in ['local','google_drive']:
+            path = f"{self.path}{file_path}.parquet"
+        elif self.context == 'vertex':
+            path = f"gs://{self.bucket_name}/preprocessed-data/{file_path}.parquet"
+        else:
+            logging.error(f"Unknown context: {self.context}. Cannot read parquet file: {file_path}")
+            return None
         data = pd.read_parquet(path)
+        
         return data
 
 
@@ -110,9 +135,35 @@ class Preprocess:
             data (pd.DataFrame): the data in dataframe format
             file_path (str): the path of the parquet file.
         """
-        path = f"{self.path}{file_path}.xlsx"
+        if self.context in ['local','google_drive']:
+            path = f"{self.path}{file_path}.xlsx"
+        elif self.context == 'vertex':
+            path = f"gs://{self.bucket_name}/preprocessed-data/{file_path}.xlsx"
+        else:
+            logging.error(f"Unknown context: {self.context}. Cannot read xlsx file: {file_path}")
+            return None
+        
         data.to_excel(path, index=False)
-        print(f"Data saved to {path}")
+        logging.info(f"Data saved to {path}")
+        
+    
+    def save_as_parquet(self, data: pd.DataFrame, file_path: str):
+        """
+        Saves the processed data to a excel file.
+        The file is saved in the specified path.
+        Args:
+            data (pd.DataFrame): the data in dataframe format
+            file_path (str): the path of the parquet file.
+        """
+        if self.context in ['local','google_drive']:
+            path = f"{self.path}{file_path}.parquet"
+        elif self.context == 'vertex':
+            path = f"gs://{self.bucket_name}/preprocessed-data/{file_path}.parquet"
+        else:
+            logging.error(f"Unknown context: {self.context}. Cannot read parquet file.")
+            return None
+        data.to_parquet(path, index=False)
+        logging.info(f"Data saved to {path}")
 
 
     def fill_levels_wells(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -127,6 +178,8 @@ class Preprocess:
             pd.DataFrame: A pandas DataFrame with the 'manual_level' column
             filled, renamed to 'level', and the 'continue_level' column removed.
         """
+        logging.info("\t- Filling missing manual levels.")
+        
         data['manual_level'] = np.where(
             data['manual_level'].isnull(), data['continue_level'], data['manual_level']
         )
@@ -163,7 +216,8 @@ class Preprocess:
             - Protected columns are excluded from null value dropping.
             - The method uses helper functions `Preprocess.drop_nulls` and `Preprocess.stl_imputation`.
         """
-        print("- Imputing missing values and smotthing data")
+        logging.info("\t- Imputing missing values.")
+        
         categorical_cols = ['system_well', 'well_id', 'meteo_id', 'system_meteo']
         protected_cols = ['ds', 'prec', 't_prom', 'evap', 'velvto']
         station_col = 'well_id' if station_type=='wells' else 'meteo_id'
@@ -200,34 +254,6 @@ class Preprocess:
         return final_data
 
 
-    def smooth_meteo(self):
-        """
-        Smooths meteorological data by applying a rolling mean to columns with missing values.
-        This method processes the `self.data_meteo` DataFrame, which is expected to contain
-        meteorological data. For each unique `meteo_id`, it applies a rolling mean with a
-        window size of 7 to columns that have missing values, excluding columns listed in
-        `protected_cols`. The smoothed data is then concatenated and returned.
-        Returns:
-            pd.DataFrame: The updated `self.data_meteo` DataFrame with smoothed values.
-        """
-
-        protected_cols = ['meteo_id','system_meteo']
-        data_list = []
-
-        for meteo_id in self.data_meteo['meteo_id'].unique():
-            data_temp = self.data_meteo[self.data_meteo['meteo_id'] == meteo_id].copy()
-            data_temp = data_temp.set_index('ds')
-            for meteo_var in data_temp.columns:
-                if data_temp[meteo_var].isnull().any() and meteo_var not in protected_cols:
-                    data_temp[meteo_var] = data_temp[meteo_var].rolling(window=7, min_periods=1).mean()
-
-                data_temp = data_temp.reset_index()
-            data_list.append(data_temp)
-
-        self.data_meteo = pd.concat(data_list, ignore_index=False)
-        return self.data_meteo
-
-
     def drop_continuos_nulls(self, data: pd.DataFrame, name_id: str, col_ref: str) -> pd.DataFrame:
         """
         Drops rows from a DataFrame where a specified column contains continuous null values
@@ -244,6 +270,8 @@ class Preprocess:
             - If a group of continuous null values exceeds 14 rows, all rows in the group are removed.
             - Intermediate columns used for computation are dropped in the final output.
         """
+        logging.info("\t- Dropping continue nulls.")
+        
         data['null_count'] =  np.where((data[col_ref].isnull()), 1, np.nan)
         data['count_cumsum'] = data['null_count'].groupby(data['null_count'].isna().cumsum()).cumsum()
         data['total_nulls_in_group'] = data.groupby(data['null_count'].isna().cumsum())['count_cumsum'].transform('max')
@@ -264,6 +292,37 @@ class Preprocess:
             'null_count','count_cumsum','total_nulls_in_group','group_number','min_ds','filter'
         ])
         return data_final
+    
+    
+    def set_cluster(self) -> pd.DataFrame:
+        """
+        Clusters wells by level and updates the data with cluster assignments.
+
+        This method performs the following steps:
+        1. Prepares the data for clustering by pivoting it.
+        2. Determines the optimal number of clusters (k) using a search within a specified range.
+        3. Visualizes the k search results.
+        4. Clusters the data using the optimal number of clusters.
+        5. Visualizes the resulting clusters.
+        6. Merges the cluster assignments back into the original data.
+
+        Returns:
+            pd.DataFrame: The updated DataFrame with an additional 'cluster' column
+                          indicating the cluster assignment for each well.
+        """
+        logging.info("\t- Clustering wells by level")
+        k_means_data = Preprocess.pivot_data(self.data_wells)
+        logging.info("\t  - Finding optimal number of clusters")
+        k_search = Preprocess.find_k(k_means_data, min_k=5, max_k=14)
+        Preprocess.plot_k_search(k_search)
+        logging.info("\t  - Aplying clusterization")
+        clustered_data = Preprocess.cluster_data(k_means_data, n_clusters=k_search['best_k'])
+        Preprocess.plot_clusters(clustered_data, n_clusters=k_search['best_k'])
+        self.data_wells = (
+            self.data_wells
+            .merge(clustered_data[['cluster']].reset_index(), how='left', on='well_id')
+        )
+        return self.data_wells
     
     
     def set_train_test(self, data: pd.DataFrame, set_index_date: bool=False) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -292,7 +351,7 @@ class Preprocess:
             data_train = data_train.set_index('ds')
             data_test = data_test.set_index('ds')
         
-        return data_train, data_test+
+        return data_train, data_test
 
 
     def preprocess_wells(self) -> pd.DataFrame:
@@ -306,14 +365,17 @@ class Preprocess:
         Returns:
             pd.DataFrame: The preprocessed well data.
         """
-        print("- Preprocessing wells data")
+        logging.info("- Preprocessing wells data.")
         self.data_wells['ds'] = pd.to_datetime(self.data_wells['ds'])
         min_date = self.data_wells['ds'].max() - pd.Timedelta(self.len_history, unit='D')
-        self.data_wells = self.data_wells[self.data_wells['ds']<=min_date].copy()
-
+        self.data_wells = self.data_wells[self.data_wells['ds']>=pd.to_datetime(min_date)].copy()
+        
         self.data_wells = self.fill_levels_wells(self.data_wells)
         self.data_wells = self.drop_continuos_nulls(self.data_wells, name_id='well_id', col_ref='level')
         self.data_wells = self.inputation(self.data_wells, station_type='wells')
+        self.data_wells = self.set_cluster()
+        
+        logging.info("- Preprocessing wells data completed.")
         return self.data_wells
 
 
@@ -323,19 +385,28 @@ class Preprocess:
         Returns:
             pd.DataFrame: A DataFrame containing the consolidated meteorological data.
         """
-        print("- Preprocessing meteo data")
+        logging.info("- Preprocessing meteo data.")
         self.data_meteo['ds'] = pd.to_datetime(self.data_meteo['ds'])
         min_date = self.data_meteo['ds'].max() - pd.Timedelta(self.len_history, unit='D')
-        self.data_meteo = self.data_meteo[self.data_meteo['ds']<=min_date].copy()
-
-        self.data_meteo = self.inputation(self.data_meteo, station_type='meteo')
-        self.data_meteo = self.smooth_meteo()
-        data_train, data_test = self.set_train_test(self.data_meteo)
-        data_test, self.metrics_predictors = Preprocess.forecast_meteo_variables()
+        self.data_meteo = self.data_meteo[self.data_meteo['ds']>=pd.to_datetime(min_date)].copy()
+        data_train_raw, data_test_raw = self.set_train_test(self.data_meteo)
+        data_train_raw = self.inputation(data_train_raw, station_type='meteo')
+        data_train = self.smooth_meteo(data_train_raw)
+        data_test_raw = self.smooth_meteo(data_test_raw)
+        Preprocess.plot_meteo_smooth(data_train_raw, data_train)
+        data_test, self.metrics_predictors = Preprocess.forecast_meteo_variables(data_train, data_test_raw)
+        
+        # precipitation will be setted as zero for data test
+        if 'prec' in data_test.columns:
+            data_test['prec'] = 0
+        if 'prec_1' in data_test.columns:
+            data_test['prec_1'] = 0
+            
+        Preprocess.plot_meteo_fcst(data_train, data_test, data_test_raw)
         
         self.data_meteo  = pd.concat([data_train, data_test], ignore_index=True)
         self.data_meteo ['ds'] = pd.to_datetime(self.data_meteo ['ds'])
-        self.data_meteo  = data.sort_values('ds')
+        self.data_meteo  = self.data_meteo.sort_values('ds')
 
         self.data_meteo ['prec_acum'] = self.data_meteo .groupby(['meteo_id'])['prec'].transform(
             lambda x: x.groupby((x != 0).cumsum()).cumsum()
@@ -353,9 +424,38 @@ class Preprocess:
         self.data_meteo ['spring'] = np.where(self.data_meteo ['month'].isin([9,10,11]), 1, 0)
         self.data_meteo ['high_plateau'] = np.where(self.data_meteo ['month'].isin([12,1,2,3]), 1, 0)
 
-        self.data_meteo  = pd.get_dummies(self.data_meteo , columns=['meteo_id'], drop_first=True)
-        self.data_meteo  = self.data_meteo.drop(columns=['month','system_meteo'], axis=1)
+        self.data_meteo  = self.data_meteo.drop(columns=['month','system'], axis=1)
+        
+        logging.info("- Preprocessing meteo data completed.")
         return self.data_meteo
+    
+    
+    def get_distances_well_meteo(self, utm_zone: int=19, hemisphere: str='S'):
+        """
+        Calculates the geodesic distance between all pairs of points from two lists of dictionaries
+        with UTM coordinates using geopy.distance.geodesic and itertools.product.
+        Args:
+            utm_zone: The UTM zone number (e.g., 18 for much of Chile).
+            hemisphere: The hemisphere of the UTM zone ('N' for Northern, 'S' for Southern).
+        Returns:
+            A pandas DataFrame with columns 'id1', 'id2', and 'distance',
+            representing the geodesic distance in meters between each pair of IDs from the two lists.
+        """
+        results = []
+        utm_proj_string = f"+proj=utm +zone={utm_zone} +{'south' if hemisphere == 'S' else 'north'} +ellps=WGS84 +datum=WGS84 +units=m +no_defs"
+        utm_crs = Proj(utm_proj_string)
+        wgs84_crs = Proj("epsg:4326")
+
+        transformer = Transformer.from_proj(utm_crs, wgs84_crs)
+
+        for well, meteo in itertools.product(self.wells_info, self.meteo_info):
+            lon1, lat1 = transformer.transform(well['utm_east'], well['utm_north'])
+            lon2, lat2 = transformer.transform(meteo['utm_east'], meteo['utm_north'])
+            distance = geodesic((lat1, lon1), (lat2, lon2)).meters
+
+            results.append({'well_id': well['station_id'], 'meteo_id': meteo['station_id'], 'distance': distance})
+
+        return pd.DataFrame(results)
 
 
     def merge_well_meteo(self) -> pd.DataFrame:
@@ -373,7 +473,7 @@ class Preprocess:
             pd.DataFrame: A DataFrame containing the merged well and meteorological data
                           with the best meteorological station for each well.
         """
-        print("- Merging well and meteo data")
+        logging.info("\t- Merging well and meteo data.")
         distances = self.get_distances_well_meteo()
         combined = (
             distances
@@ -396,37 +496,8 @@ class Preprocess:
             .merge(self.data_meteo, on=['meteo_id', 'ds'], suffixes=('_well', '_meteo'))
         )
         self.data['ds'] = pd.to_datetime(self.data['ds'])
-        return self.data
-
-
-    def set_cluster(self) -> pd.DataFrame:
-        """
-        Clusters wells by level and updates the data with cluster assignments.
-
-        This method performs the following steps:
-        1. Prepares the data for clustering by pivoting it.
-        2. Determines the optimal number of clusters (k) using a search within a specified range.
-        3. Visualizes the k search results.
-        4. Clusters the data using the optimal number of clusters.
-        5. Visualizes the resulting clusters.
-        6. Merges the cluster assignments back into the original data.
-
-        Returns:
-            pd.DataFrame: The updated DataFrame with an additional 'cluster' column
-                          indicating the cluster assignment for each well.
-        """
-        print("- Clustering wells by level")
-        k_means_data = Preprocess.pivot_data(self.data)
-        print("\t- Finding optimal number of clusters")
-        k_search = Preprocess.find_k(k_means_data, min_k=5, max_k=14)
-        Preprocess.plot_k_search(k_search)
-        print("\t- Aplying clusterization")
-        clustered_data = Preprocess.cluster_data(k_means_data, n_clusters=k_search['best_k'])
-        Preprocess.plot_clusters(clustered_data, n_clusters=k_search['best_k'])
-        self.data = (
-            self.data
-            .merge(clustered_data[['cluster']].reset_index(), how='left', on='well_id')
-        )
+        self.data  = pd.get_dummies(self.data , columns=['system','meteo_id'], drop_first=True, dtype='int64')
+        
         return self.data
 
 
@@ -438,15 +509,17 @@ class Preprocess:
             pd.DataFrame: A DataFrame containing the preprocessed and imputed data
             for all wells
         """
-        print("Preprocessing data")
+        logging.info("Preprocessing data")
         _ = self.preprocess_meteo()
         _ = self.preprocess_wells()
-        _ = self.merge_well_meteo()
-        _ = self.inputation()
-        _ = self.set_cluster()
-        self.save_data()
-        print("Preprocessing completed")
-        return self.data
+        self.data = self.merge_well_meteo()
+        self.save_as_parquet(self.data, file_path='all_data')
+        self.data_train, self.data_test = self.set_train_test(self.data)
+        self.save_as_parquet(self.data_train, file_path='train')
+        self.save_as_parquet(self.data_test, file_path='test')
+        logging.info("Preprocessing completed")
+        
+        return self.data_train, self.data_test
 
 
     @staticmethod
@@ -491,7 +564,7 @@ class Preprocess:
             df_imputed = df_deseasonalised_imputed + seasonal_component
         except:
             df_imputed = data[variable]
-            print(f"Imputation failed for {variable}")
+            logging.error(f"Imputation failed for {variable}")
             pass
         return df_imputed, imputed_indices
 
@@ -511,6 +584,37 @@ class Preprocess:
         plt.ylabel(variable)
         plt.xlabel("ds")
         plt.show()
+        
+    @staticmethod
+    def smooth_meteo(data: pd.DataFrame, window: int=15, min_periods: int=1):
+        """
+        Smooths meteorological data by applying a rolling mean to columns with missing values.
+        This method processes the `self.data_meteo` DataFrame, which is expected to contain
+        meteorological data. For each unique `meteo_id`, it applies a rolling mean with a
+        window size of 7 to columns that have missing values, excluding columns listed in
+        `protected_cols`. The smoothed data is then concatenated and returned.
+        Args:
+            data (pd.DataFrame): The data_meteo DataFrame .
+        Returns:
+            pd.DataFrame: The updated data_meteo DataFrame with smoothed values.
+        """
+        logging.info("\t- Smotthing meteo data.")
+        
+        protected_cols = ['meteo_id','system','prec','prec_1']
+        data_list = []
+
+        for meteo_id in data['meteo_id'].unique():
+            data_temp = data[data['meteo_id'] == meteo_id].copy()
+            data_temp = data_temp.set_index('ds')
+            for meteo_var in data_temp.columns:
+                if meteo_var not in protected_cols:
+                    data_temp[meteo_var] = data_temp[meteo_var].rolling(window=window, min_periods=min_periods).mean()
+
+            data_temp = data_temp.reset_index()
+            data_list.append(data_temp)
+
+        data_final = pd.concat(data_list, ignore_index=False)
+        return data_final
 
     @staticmethod
     def pivot_data(data: pd. DataFrame) -> pd.DataFrame:
@@ -521,7 +625,6 @@ class Preprocess:
         Returns:
             pd.DataFrame: A transformed DataFrame where:
         """
-        data['well_id'] = data['well_id'].astype(str)
         data_pivot = (
             data
             .pivot(index='ds', columns='well_id', values='level')
@@ -574,6 +677,7 @@ class Preprocess:
         best_k = k_values[np.argmax(combined_scores)]
         return {'k_values': k_values, 'silhouette_scores': silhouette_scores, 'inertia':inertia_scores, 'best_k': best_k}
 
+    
     @staticmethod
     def plot_k_search(k_search: dict):
         """
@@ -589,8 +693,7 @@ class Preprocess:
                 - 'inertia' (list of float): The inertia values corresponding to each k value.
                 - 'best_k' (int): The optimal number of clusters (k) determined.
         """
-        fig, ax1 = plt.subplots()
-
+        fig, ax1 = plt.subplots(figsize=(10,6))
         color = 'tab:red'
         ax1.set_xlabel('Number of Clusters (k)')
         ax1.set_ylabel('Silhouette Score', color=color)
@@ -604,10 +707,11 @@ class Preprocess:
         ax2.tick_params(axis='y', labelcolor=color)
 
         ax1.axvline(x=k_search['best_k'], color='green', linestyle='--', linewidth=2)
-
+        plt.grid()
         plt.title('Evaluation of Number of Clusters (k)')
         plt.show()
 
+        
     @staticmethod
     def cluster_data(data: pd.DataFrame, n_clusters: int, seed: int=42) -> pd.DataFrame:
         """
@@ -625,6 +729,7 @@ class Preprocess:
         data['cluster'] = clusters
         return data
 
+    
     @staticmethod
     def plot_clusters(data: pd.DataFrame, n_clusters: int):
         """
@@ -657,8 +762,43 @@ class Preprocess:
 
         plt.tight_layout()
         plt.show()
+    
+    
+    @staticmethod
+    def plot_meteo_smooth(data_raw: pd.DataFrame, data: pd.DataFrame):
+        
+        for meteo_id in data['meteo_id'].unique():
+            print(f'Forecast smooth for {meteo_id}')
+        
+            data_meteo = data[data['meteo_id']==meteo_id].copy()
+            data_meteo_raw = data_raw[
+                (data_raw['meteo_id']==meteo_id)
+                & (data_raw['ds'].between(data_meteo['ds'].min(), data_meteo['ds'].max()))
+            ].set_index('ds')
+            data_meteo = (
+                data_meteo
+                .dropna(axis=1)
+                .set_index('ds')
+            )
+            meteo_variables = [col for col in data_meteo.columns if col not in ['ds','meteo_id','system']]
 
+            num_columnas = 3
+            num_filas = int(np.ceil(len(meteo_variables) / num_columnas))
 
+            plt.figure(figsize=(20, num_filas * 4))
+
+            for i, var in enumerate(meteo_variables):
+                plt.subplot(num_filas, num_columnas, i+1)
+                plt.plot(data_meteo_raw[var], label=var)
+                plt.plot(data_meteo[var], label=f'{var} smoothed')
+                plt.title(var)
+                plt.legend(fontsize='small')
+                plt.grid()
+                plt.xticks(rotation=45)
+
+            plt.tight_layout()
+            plt.show()
+        
     @staticmethod
     def calculate_metrics(true_values, predicted_values):
         metrics = {}
@@ -671,7 +811,7 @@ class Preprocess:
 
     @staticmethod
     def forecast_predictors(data_train: pd.DataFrame, data_test: pd.DataFrame, predictor: 'str', plot_compon: bool=False, plot_predict: bool=False):
-        model = Prophet(daily_seasonality=False, weekly_seasonality=False, holidays_prior_scale=0)
+        model = Prophet(daily_seasonality=False, weekly_seasonality=False, yearly_seasonality=True, holidays_prior_scale=0)
         train = data_train[['ds', predictor]].copy()
         train = train.rename(columns={predictor:'y'})
         test = data_test[['ds', predictor]].copy()
@@ -699,14 +839,14 @@ class Preprocess:
     def forecast_meteo_variables(data_train: pd.DataFrame, data_test: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
         meteo_ids = data_train['meteo_id'].unique()
-        meteo_variables = [col for col in data_train.columns if col not in ['ds','well_id','system_well','reference_level','level','meteo_id','system_meteo','cluster']]
+        meteo_variables = [col for col in data_train.columns if col not in ['ds','system','meteo_id']]
         non_forecasted_columns = [col for col in data_test.columns if col not in meteo_variables]
         
         new_data_test_list = []
         evaluation_results = []
 
         for meteo_id in meteo_ids:
-            print(f"Forecasting variables for meteo_id {meteo_id}")
+            logging.info(f"\t- Forecasting variables for meteo_id {meteo_id}")
             train_subset = data_train[data_train['meteo_id'] == meteo_id].copy()
             test_subset = data_test[data_test['meteo_id'] == meteo_id].copy()
             new_test = test_subset[non_forecasted_columns].copy()
@@ -738,9 +878,41 @@ class Preprocess:
 
             new_data_test_list.append(new_test)
         
-        print(f"Creating new data test with predicted foreacsted variables")
+        logging.info(f"\t- Creating new data test with predicted forecasted variables")
         new_data_test = pd.concat(new_data_test_list, ignore_index=True)
         evaluation_df = pd.DataFrame(evaluation_results)
 
         return new_data_test, evaluation_df
+    
+    @staticmethod
+    def plot_meteo_fcst(data_train: pd.DataFrame, data_test: pd.DataFrame, data_test_raw: pd.DataFrame):
+        
+        for meteo_id in data_train['meteo_id'].unique():
+            print(f'Forecast predictors for {meteo_id}')
+            
+            train = (
+                data_train[data_train['meteo_id']==meteo_id]
+                .set_index('ds')
+                .dropna(axis=1)
+            )
+            test = data_test[data_test['meteo_id']==meteo_id].set_index('ds')
+            test_raw = data_test_raw[data_test_raw['meteo_id']==meteo_id].set_index('ds')
+            meteo_variables = [col for col in train.columns if col not in ['ds','meteo_id','system']]
+            
+            num_columnas = 3
+            num_filas = int(np.ceil(len(meteo_variables) / num_columnas))
 
+            plt.figure(figsize=(20, num_filas * 4))
+
+            for i, var in enumerate(meteo_variables):
+                plt.subplot(num_filas, num_columnas, i+1)
+                plt.plot(train[var], label=var)
+                plt.plot(test_raw[var], label=f'{var} test')
+                plt.plot(test[var], label=f'{var} forecasted')
+                plt.title(var)
+                plt.legend(fontsize='small')
+                plt.grid()
+                plt.xticks(rotation=45)
+
+            plt.tight_layout()
+            plt.show()
